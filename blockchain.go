@@ -13,6 +13,8 @@ package emulator
 import (
 	"errors"
 	"fmt"
+	"os"
+	goRuntime "runtime"
 	"sync"
 	"time"
 
@@ -360,8 +362,14 @@ func configureFVM(conf config, blocks *blocks) (*fvm.VirtualMachine, fvm.Context
 
 	vm := fvm.NewVirtualMachine(rt)
 
+	f, err := os.CreateTemp(".", "logs-")
+	if err != nil {
+		panic(err)
+	}
+
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	ctx := fvm.NewContext(
-		zerolog.Nop(),
+		zerolog.New(f),
 		fvm.WithChain(conf.GetChainID().Chain()),
 		fvm.WithBlocks(blocks),
 		fvm.WithRestrictedDeployment(false),
@@ -900,10 +908,46 @@ func (b *Blockchain) executeNextTransaction(ctx fvm.Context) (*types.Transaction
 			ledgerView state.View,
 			txIndex uint32,
 			txBody *flowgo.TransactionBody,
-		) (*fvm.TransactionProcedure, error) {
-			tx := fvm.Transaction(txBody, txIndex)
+		) (tx *fvm.TransactionProcedure, err error) {
 
-			err := b.vm.Run(ctx, tx, ledgerView, programs.NewEmptyPrograms())
+			startedAt := time.Now()
+
+			var memAllocBefore uint64
+			var m goRuntime.MemStats
+			if ctx.Logger.Debug().Enabled() {
+				goRuntime.ReadMemStats(&m)
+				memAllocBefore = m.TotalAlloc
+			}
+
+			defer func() {
+				evt := ctx.Logger.With().
+					Str("tx_id", txBody.ID().String()).
+					Str("block_id", b.pendingBlock.ID().String()).
+					Uint64("computation_used", tx.ComputationUsed).
+					Int64("timeSpentInMS", time.Since(startedAt).Milliseconds())
+
+				if ctx.Logger.Debug().Enabled() {
+					goRuntime.ReadMemStats(&m)
+					memAllocAfter := m.TotalAlloc
+					evt = evt.Uint64("memAlloc", memAllocAfter-memAllocBefore)
+				}
+
+				lg := evt.
+					Logger()
+
+				if tx.Err != nil {
+					lg.Info().
+						Str("error_message", tx.Err.Error()).
+						Uint16("error_code", uint16(tx.Err.Code())).
+						Msg("transaction executed failed")
+				} else {
+					lg.Info().Msg("transaction executed successfully")
+				}
+			}()
+
+			tx = fvm.Transaction(txBody, txIndex)
+
+			err = b.vm.Run(ctx, tx, ledgerView, programs.NewEmptyPrograms())
 			if err != nil {
 				return nil, err
 			}
